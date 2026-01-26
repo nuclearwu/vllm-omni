@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from diffusers.models.attention import FeedForward
+import torch.nn.functional as F
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
@@ -14,9 +14,10 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
 from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -24,6 +25,59 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+class ColumnParallelApproxGELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in,
+            dim_out,
+            bias=bias,
+            gather_output=False,
+            return_bias=False,
+        )
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        return F.gelu(x, approximate=self.approximate)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        activation_fn: str = "gelu-approximate",
+        inner_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+
+        assert activation_fn == "gelu-approximate", "Only gelu-approximate is supported."
+
+        inner_dim = inner_dim or int(dim * mult)
+        dim_out = dim_out or dim
+
+        layers: list[nn.Module] = [
+            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            nn.Identity(),  # placeholder for weight loading
+            RowParallelLinear(
+                inner_dim,
+                dim_out,
+                input_is_parallel=True,
+                return_bias=False,
+            ),
+        ]
+
+        self.net = nn.ModuleList(layers)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
 
 
 class FluxAttention(torch.nn.Module):
@@ -63,14 +117,11 @@ class FluxAttention(torch.nn.Module):
             hidden_size=query_dim,
             head_size=self.head_dim,
             total_num_heads=self.heads,
-            disable_tp=True,
             bias=bias,
         )
 
         if not self.pre_only:
-            self.to_out = torch.nn.ModuleList([])
-            self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
-            self.to_out.append(torch.nn.Dropout(dropout))
+            self.to_out = RowParallelLinear(self.inner_dim, self.query_dim, bias=out_bias)
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -80,18 +131,18 @@ class FluxAttention(torch.nn.Module):
                 hidden_size=self.added_kv_proj_dim,
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
-                disable_tp=True,
                 bias=added_proj_bias,
             )
 
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(self.inner_dim, self.query_dim, bias=out_bias)
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.to_qkv.num_kv_heads,
         )
 
     def forward(
@@ -100,25 +151,30 @@ class FluxAttention(torch.nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
         qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query, key, value = qkv.chunk(3, dim=-1)
-
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
+            add_q_size = self.add_kv_proj.num_heads * self.head_dim
+            add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
+            encoder_query, encoder_key, encoder_value = encoder_qkv.split(
+                [add_q_size, add_kv_size, add_kv_size], dim=-1
+            )
 
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_heads, -1))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
@@ -134,24 +190,28 @@ class FluxAttention(torch.nn.Module):
             query = self.rope(query, cos, sin)
             key = self.rope(key, cos, sin)
 
+        # Cast to correct dtype
+        dtype = query.dtype
+        query, key = query.to(dtype), key.to(dtype)
         hidden_states = self.attn(
             query,
             key,
             value,
         )
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(dtype)
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states = self.to_out[0](hidden_states)
-            hidden_states = self.to_out[1](hidden_states)
+            hidden_states, _ = self.to_out(hidden_states)
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
         else:
+            if get_tensor_model_parallel_world_size() > 1:
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
 
 
@@ -176,10 +236,10 @@ class FluxTransformerBlock(nn.Module):
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff = FeedForward(dim=dim, dim_out=dim)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff_context = FeedForward(dim=dim, dim_out=dim)
 
     def forward(
         self,
@@ -541,17 +601,22 @@ class FluxTransformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            original_name = name
+            lookup_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in original_name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                lookup_name = original_name.replace(weight_name, param_name)
+                param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                if lookup_name not in params_dict and ".to_out.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+                param = params_dict[lookup_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            loaded_params.add(original_name)
+            loaded_params.add(lookup_name)
         return loaded_params
