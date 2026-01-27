@@ -695,8 +695,8 @@ class QwenImageEditPipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: str | list[str] = "",
-        negative_prompt: str | list[str] = "",
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,
         true_cfg_scale: float = 4.0,
         height: int | None = None,
@@ -717,8 +717,8 @@ class QwenImageEditPipeline(
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         """Forward pass for image editing."""
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        prompt = req.prompt
+        negative_prompt = req.negative_prompt
 
         # Get preprocessed image from request (pre-processing is done in DiffusionEngine)
         if hasattr(req, "preprocessed_image"):
@@ -748,6 +748,8 @@ class QwenImageEditPipeline(
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator
         true_cfg_scale = req.true_cfg_scale or true_cfg_scale
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs
