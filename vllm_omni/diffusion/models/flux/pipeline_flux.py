@@ -54,6 +54,7 @@ def get_flux_post_process_func(
 
     return post_process_func
 
+
 def calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
