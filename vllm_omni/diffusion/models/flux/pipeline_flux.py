@@ -9,7 +9,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
-import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import TextualInversionLoaderMixin
@@ -35,6 +34,8 @@ logger = logging.getLogger(__name__)
 def get_flux_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
+    if od_config.output_type == "latent":
+        return lambda x: x
     model_name = od_config.model
     if os.path.exists(model_name):
         model_path = model_name
@@ -52,7 +53,6 @@ def get_flux_post_process_func(
         return image_processor.postprocess(images)
 
     return post_process_func
-
 
 def calculate_shift(
     image_seq_len,
@@ -258,8 +258,6 @@ class FluxPipeline(
         max_sequence_length: int = 512,
         dtype: torch.dtype | None = None,
     ):
-        dtype = dtype or self.text_encoder.dtype
-
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -279,7 +277,7 @@ class FluxPipeline(
         untruncated_ids = self.tokenizer_2(prompt, padding="longest", return_tensors="pt").input_ids
 
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
             logger.warning(
                 "The following part of your input was truncated because `max_sequence_length` is set to "
                 f" {max_sequence_length} tokens: {removed_text}"
@@ -387,55 +385,6 @@ class FluxPipeline(
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=self.device, dtype=dtype)
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
-
-    def encode_image(self, image, num_images_per_prompt):
-        dtype = next(self.image_encoder.parameters()).dtype
-
-        if not isinstance(image, torch.Tensor):
-            image = self.feature_extractor(image, return_tensors="pt").pixel_values
-
-        image = image.to(device=self.device, dtype=dtype)
-        image_embeds = self.image_encoder(image).image_embeds
-        image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
-        return image_embeds
-
-    def prepare_ip_adapter_image_embeds(self, ip_adapter_image, ip_adapter_image_embeds, num_images_per_prompt):
-        image_embeds = []
-        if ip_adapter_image_embeds is None:
-            if not isinstance(ip_adapter_image, list):
-                ip_adapter_image = [ip_adapter_image]
-
-            if len(ip_adapter_image) != self.transformer.encoder_hid_proj.num_ip_adapters:
-                raise ValueError(
-                    f"`ip_adapter_image` must have same length as the number of IP Adapters. "
-                    f"Got {len(ip_adapter_image)} images "
-                    f"and {self.transformer.encoder_hid_proj.num_ip_adapters} IP Adapters."
-                )
-
-            for single_ip_adapter_image in ip_adapter_image:
-                single_image_embeds = self.encode_image(single_ip_adapter_image, 1)
-                image_embeds.append(single_image_embeds[None, :])
-        else:
-            if not isinstance(ip_adapter_image_embeds, list):
-                ip_adapter_image_embeds = [ip_adapter_image_embeds]
-
-            if len(ip_adapter_image_embeds) != self.transformer.encoder_hid_proj.num_ip_adapters:
-                raise ValueError(
-                    f"`ip_adapter_image_embeds` must have same length as the number of IP Adapters. "
-                    f"Got {len(ip_adapter_image_embeds)} image embeds "
-                    f"and {self.transformer.encoder_hid_proj.num_ip_adapters} IP Adapters."
-                )
-
-            for single_image_embeds in ip_adapter_image_embeds:
-                image_embeds.append(single_image_embeds)
-
-        ip_adapter_image_embeds = []
-        for single_image_embeds in image_embeds:
-            single_image_embeds = torch.cat([single_image_embeds] * num_images_per_prompt, dim=0)
-            single_image_embeds = single_image_embeds.to(device=self.device)
-            ip_adapter_image_embeds.append(single_image_embeds)
-
-        return ip_adapter_image_embeds
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
@@ -555,8 +504,6 @@ class FluxPipeline(
         negative_pooled_prompt_embeds,
         latents,
         latent_image_ids,
-        image_embeds,
-        negative_image_embeds,
         text_ids,
         negative_text_ids,
         timesteps,
@@ -573,8 +520,6 @@ class FluxPipeline(
             self._current_timestep = t
             # broadcast to batch dimension and place on same device/dtype as latents
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-            if image_embeds is not None:
-                self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
 
             self.transformer.do_true_cfg = do_true_cfg  # used in teacache hook
             # Forward pass for positive prompt (or unconditional if no CFG)
@@ -592,9 +537,6 @@ class FluxPipeline(
 
             # Forward pass for negative prompt (CFG)
             if do_true_cfg:
-                if negative_image_embeds is not None:
-                    self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
-
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -629,10 +571,6 @@ class FluxPipeline(
         latents: torch.FloatTensor | None = None,
         prompt_embeds: torch.FloatTensor | None = None,
         pooled_prompt_embeds: torch.FloatTensor | None = None,
-        ip_adapter_image: PIL.Image.Image | torch.Tensor | None = None,
-        ip_adapter_image_embeds: torch.FloatTensor | None = None,
-        negative_ip_adapter_image: PIL.Image.Image | torch.Tensor | None = None,
-        negative_ip_adapter_image_embeds: list[torch.Tensor] | None = None,
         negative_prompt_embeds: torch.FloatTensor | None = None,
         negative_pooled_prompt_embeds: torch.FloatTensor | None = None,
         output_type: str | None = "pil",
@@ -739,35 +677,8 @@ class FluxPipeline(
         else:
             guidance = None
 
-        if (ip_adapter_image is not None or ip_adapter_image_embeds is not None) and (
-            negative_ip_adapter_image is None and negative_ip_adapter_image_embeds is None
-        ):
-            negative_ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
-            negative_ip_adapter_image = [negative_ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
-
-        elif (ip_adapter_image is None and ip_adapter_image_embeds is None) and (
-            negative_ip_adapter_image is not None or negative_ip_adapter_image_embeds is not None
-        ):
-            ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
-            ip_adapter_image = [ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
-
         if self.joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
-
-        image_embeds = None
-        negative_image_embeds = None
-        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-            image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image,
-                ip_adapter_image_embeds,
-                batch_size * num_images_per_prompt,
-            )
-        if negative_ip_adapter_image is not None or negative_ip_adapter_image_embeds is not None:
-            negative_image_embeds = self.prepare_ip_adapter_image_embeds(
-                negative_ip_adapter_image,
-                negative_ip_adapter_image_embeds,
-                batch_size * num_images_per_prompt,
-            )
 
         latents = self.diffuse(
             prompt_embeds,
@@ -776,8 +687,6 @@ class FluxPipeline(
             negative_pooled_prompt_embeds,
             latents,
             latent_image_ids,
-            image_embeds,
-            negative_image_embeds,
             text_ids,
             negative_text_ids,
             timesteps,

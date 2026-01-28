@@ -190,8 +190,8 @@ class FluxAttention(torch.nn.Module):
             )
 
             encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
