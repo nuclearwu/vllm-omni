@@ -121,7 +121,18 @@ class FluxAttention(torch.nn.Module):
         )
 
         if not self.pre_only:
-            self.to_out = RowParallelLinear(self.inner_dim, self.query_dim, bias=out_bias)
+            self.to_out = nn.ModuleList(
+                [
+                    RowParallelLinear(
+                        self.inner_dim,
+                        self.out_dim,
+                        bias=out_bias,
+                        input_is_parallel=True,
+                        return_bias=False,
+                    ),
+                    nn.Dropout(dropout),
+                ]
+            )
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -134,7 +145,13 @@ class FluxAttention(torch.nn.Module):
                 bias=added_proj_bias,
             )
 
-            self.to_add_out = RowParallelLinear(self.inner_dim, self.query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                return_bias=False,
+            )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
@@ -151,7 +168,7 @@ class FluxAttention(torch.nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
-    ):
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
@@ -190,26 +207,25 @@ class FluxAttention(torch.nn.Module):
             query = self.rope(query, cos, sin)
             key = self.rope(key, cos, sin)
 
-        # Cast to correct dtype
-        dtype = query.dtype
-        query, key = query.to(dtype), key.to(dtype)
         hidden_states = self.attn(
             query,
             key,
             value,
         )
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(dtype)
+        hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states, _ = self.to_out(hidden_states)
-            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            hidden_states = self.to_out[0](hidden_states)
+            hidden_states = self.to_out[1](hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
         else:
+            # For single-stream blocks, there's no to_out (RowParallelLinear) to handle the reduction
             if get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
