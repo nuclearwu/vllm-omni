@@ -321,7 +321,7 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
-            pipeline: The LongCatImage pipeline instance.
+            pipeline: The Flux pipeline instance.
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
