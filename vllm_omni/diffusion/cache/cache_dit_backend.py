@@ -345,6 +345,7 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
 
     return refresh_cache_context
 
+
 def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for FLUX.2-klein-4B pipeline.
 
@@ -409,12 +410,14 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
                         mask_policy=cache_config.scm_steps_mask_policy,
                         total_steps=num_inference_steps,
                     ),
+                    Fn_compute_blocks=db_cache_config.Fn_compute_blocks,
                     steps_computation_policy=cache_config.scm_steps_policy,
                 ),
                 verbose=verbose,
             )
 
     return refresh_cache_context
+
 
 def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for StableDiffusion3Pipeline.
