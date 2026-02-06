@@ -352,6 +352,9 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
     Args:
         pipeline: The FLUX.2-klein-4B pipeline instance.
         cache_config: DiffusionCacheConfig instance with cache configuration.
+    Returns:
+        A refresh function that can be called with a new ``num_inference_steps``
+        to update the cache context for the pipeline.
     """
     # Build DBCacheConfig for transformer
     db_cache_config = _build_db_cache_config(cache_config)
